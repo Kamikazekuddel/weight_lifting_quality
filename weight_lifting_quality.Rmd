@@ -1,0 +1,181 @@
+---
+title: "Weight Lifting Quality"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Summary
+We identified major leakage in the weight lifting data. Afterwards we trained a
+model on the features not affected by the leakage. The model was a random forest,
+where we tuned the features used per tree. The model had a 5-fold CV accuracy of above
+99% and we expect out of sample error to be similar. Indeed the model was able
+to correctly predict the 20 test cases.
+
+##Data loading and libraries
+
+```{r,results='hide',message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(caret)
+
+training <- read.csv('pml-training.csv',
+                     na.strings = c("NA",""),
+                     stringsAsFactors = FALSE) %>% as_tibble()
+
+testing <- read.csv('pml-testing.csv',
+                    na.strings = c("NA",""),
+                    stringsAsFactors = TRUE) %>%  as_tibble()
+```
+
+## EDA
+
+### Leackage
+There is some strong leakage in the data. There is only data for every
+participant for a 3 to 4 min interval. During which the participant performed
+the exercise with increasing intensity. This can be seen when plotting the
+`classe` target against time. For time we take `raw_timestamp_part_1` which is
+time in seconds. We also added the corresponding times from the testing set
+as red vertical lines to the plots.
+
+```{r}
+scoreTimeDependence <- function(name) {
+  training %>% 
+    filter(user_name == name) %>% 
+  {plot(x=.[['raw_timestamp_part_1']],y=factor(.[['classe']]),
+    xlab='raw_timestamp_part_1',ylab='classe')}
+  
+  testing %>%
+    filter(user_name == name) %>% 
+    {abline(v=.[['raw_timestamp_part_1']],col='red')}
+  
+  title(main = name)
+}
+
+unique_names <- training$user_name %>% unique()
+
+par(mfrow=c(3,2))
+for (n in unique_names) {
+  scoreTimeDependence(n)
+}
+```
+
+From this it can be seen that the the timestamp contains in fact leakage
+and can be used to make perfect prediction on the test set by matching the
+target according to the intercept. We assume that this is not in the spirit
+of the exercise and therefore exclude all features that possibly allow leakage
+of this type. This includes `raw_timestamp_part_1`, `raw_timestamp_part_2`
+`cvtd_timestamp`, `num_window` and `X`. The `num_window` feature is defined by timestamp
+and one can indeed check that each window number corresponds to exactly one target.
+
+```{r}
+training %>%
+  group_by(num_window) %>%
+  summarize(diff_cl = n_distinct(classe)) %>%
+  arrange(desc(diff_cl)) %>%
+  head()
+```
+
+The sample number `X` contains leackage because the samples appear to be numbered
+chronologically, so `X` inherits the leackage from the timestamp feautres.
+
+### New Window, aggregates and test data.
+
+When looking at the percentage of missing values per column one notices that
+there is only one non-zero percentage for all columns with missing values.
+
+```{r}
+table(colMeans(is.na(training)))
+```
+
+This suggests that the data might be missing conditional on some other variable
+and in fact, the `new_window` variable explains all the missing values. If
+new value equals *yes* there are no missing values.
+
+```{r}
+table(colMeans(is.na(training %>% filter(new_window == 'yes'))))
+```
+
+A more careful look at the missing columns shows that all missing values
+correspond to columns containing aggregated values like max, min, avg etc.
+Apparently the aggregates for a particular `num_window` are only written to
+the row with `new_window` equal to *yes*.
+How does this relate to the data which we want to predict? In fact all the testing
+data has `new_window` equal to *no* and as a consequence no aggregated values.
+The provided aggregated values can therefore not be used make reasonable predictions
+and are excluded in our model. As `new_window` contains no other useful information
+we also exclude it as a feature. Finally we derive a feature list for model
+training as follows.
+
+```{r}
+cs <- colSums(is.na(testing))
+features <- names(cs[cs != 20])
+exlist <- c('X','raw_timestamp_part_1','raw_timestamp_part_2','cvtd_timestamp',
+            'new_window','num_window','problem_id')
+features <- features[!features %in% exlist]
+length(features)
+```
+
+Where we additonally excluded the problem_id, as it is not part of the train set.
+As we can see we end up with `r length(features)` in the end.
+
+Note that there is also a problem with "#DIV/0!" strings in the dataset. Since
+these only appear in aggregated columns we don't have to deal with this issue
+since we excluded all these columns for our model.
+
+```{r}
+print("Training data has a '#DIV/0!' problem")
+print(paste('Number occurences:',
+            sum(apply(training,c(1,2),FUN = function(x) grepl('#DIV/0!',x)))))
+print("Our final features don't have the problem")
+print(paste('Number occurences:',
+            sum(apply(training[,features],c(1,2),FUN = function(x) grepl('#DIV/0!',x)))))
+```
+
+## Model selection and model training
+
+In order to select and tune a model we'll rely on caret's train function. We'll
+configure the train control argument to perform 5-fold cross-validation using
+accuracy as a metric. Our goal is to train a random forest using the 'rf' method,
+because random forest are amount the strongest out of the box models.
+We'll set the number of trees to 50  to keep the run time short and use a maximum
+number of nodes equal to 512 also to put a bound on run time.
+We'll then let the model tune the mtry parameter, 
+which controls how many features are used for each single tree in the forest.
+We supply a mtry grid with three
+values in order to demonstrate tuning while still keeping the overall report simple.
+We do not perform any explicit pre-processing on top of the feature selection (like
+centering or scaling) as it is not necessary for trees.
+
+```{r}
+  grid <- expand.grid(mtry=c(10,25,40))
+  tc <- trainControl(method="cv",number = 5)
+  mdl <- train(classe~.,
+               data = training[,c(features,'classe')],
+               metric = "Accuracy",
+               method='rf',
+               trControl = tc,
+               maxnodes=512,
+               ntree=50,
+               tuneGrid = grid)
+  print(mdl)
+```
+
+We see that cross validation selected the model with mtry = 25 for us.
+So this model will (automatically) be used for the predictions. The average accuracy
+in the cross validation for mtry=25 is above 99%. We expect the out of sample
+error rate to be similar (due to our cross validation), i.e. 99% accuracy.
+In particular we can hope to predict all the 20 test
+cases correctly as a three standard deviations confidence interval for 20
+samples at 99% accuracy leads to roughly $19.8 \pm 3\times0.1$ correct predictions.
+This is a confidence interval of 99.7% under normal distribution approximation.
+
+Finally our predictions are 
+```{r}
+predict(mdl,testing[,features])
+```
+,which indeed all turned out to be correct. For an overall summary see the beginning
+of the report.
